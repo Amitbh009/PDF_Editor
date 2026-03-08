@@ -1,0 +1,39 @@
+name: Build Flutter APK
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:  # Allows manual triggering
+
+jobs:
+  build-android:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+      
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.22.0'
+          channel: 'stable'
+      
+      - name: Install dependencies
+        run: flutter pub get
+        working-directory: flutter_app  # Change this if your app is in a different folder
+      
+      - name: Build APK
+        run: flutter build apk --release
+        working-directory: flutter_app  # Change this if your app is in a different folder
+      
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Android-APK
+          path: flutter_app/build/app/outputs/flutter-apk/app-release.apk  # Adjust path if needed
