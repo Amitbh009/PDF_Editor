@@ -43,10 +43,12 @@ final currentPageProvider = StateProvider<int>((ref) => 1);
 
 enum EditorTool {
   select,
+  editText,      // ★ Word-style: click existing text to edit it
+  insertText,    // ★ Word-style: click empty area to type new text
   highlight,
   underline,
   strikethrough,
-  text,
+  text,          // sticky note annotation
   draw,
   eraser,
 }
