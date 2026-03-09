@@ -43,8 +43,16 @@ class ApiService {
 
   Future<List<TextBlock>> getPageTextBlocks(String fileId, int page) async {
     final r = await _dio.get('/text/$fileId/$page');
-    final blocks = r.data['blocks'] as List;
+    final blocks = r.data['blocks'] as List? ?? [];
     return blocks.map((b) => TextBlock.fromJson(Map<String, dynamic>.from(b))).toList();
+  }
+
+  // ── OCR — Run Tesseract to make PDF text editable ──
+  Future<Map<String, dynamic>> runOcr(String fileId, {bool embed = true, int? page}) async {
+    String url = '/ocr/$fileId?embed=$embed';
+    if (page != null) url += '&page=$page';
+    final r = await _dio.post(url);
+    return Map<String, dynamic>.from(r.data);
   }
 
   // ── Inline text edit (click text → edit in place) ──

@@ -14,18 +14,12 @@ class PdfViewerArea extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final currentPage = ref.watch(currentPageProvider);
     final zoom = ref.watch(zoomLevelProvider);
-
     return Container(
       color: const Color(0xFFD0D0D0),
       child: InteractiveViewer(
-        minScale: 0.3,
-        maxScale: 5.0,
+        minScale: 0.3, maxScale: 5.0,
         child: Center(
-          child: _PageWithTextOverlay(
-            document: document,
-            page: currentPage,
-            zoom: zoom,
-          ),
+          child: _PageCanvas(document: document, page: currentPage, zoom: zoom),
         ),
       ),
     );
@@ -33,55 +27,44 @@ class PdfViewerArea extends ConsumerWidget {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Page with Word-like text overlay
+// Page canvas — handles render + OCR overlay + all editing interactions
 // ─────────────────────────────────────────────────────────────────────────────
 
-class _PageWithTextOverlay extends ConsumerStatefulWidget {
+class _PageCanvas extends ConsumerStatefulWidget {
   final PdfDocument document;
   final int page;
   final double zoom;
-
-  const _PageWithTextOverlay({
-    required this.document, required this.page, required this.zoom,
-  });
+  const _PageCanvas({required this.document, required this.page, required this.zoom});
 
   @override
-  ConsumerState<_PageWithTextOverlay> createState() => _PageWithTextOverlayState();
+  ConsumerState<_PageCanvas> createState() => _PageCanvasState();
 }
 
-class _PageWithTextOverlayState extends ConsumerState<_PageWithTextOverlay> {
-  // Page render data
+class _PageCanvasState extends ConsumerState<_PageCanvas> {
+  // Render state
   String? _imageB64;
-  double _pdfWidth = 595;
-  double _pdfHeight = 842;
-  double _renderWidth = 892;
-  double _renderHeight = 1263;
+  double _pdfW = 595, _pdfH = 842;
+  double _renderW = 892, _renderH = 1263;
   bool _loading = true;
   String? _error;
 
-  // Text blocks loaded for editing
-  List<TextBlock> _textBlocks = [];
-  bool _textBlocksLoaded = false;
+  // OCR state
+  List<TextBlock> _words = [];
+  bool _ocrDone = false;
+  bool _ocrRunning = false;
 
-  // Selection / annotation drag
-  Offset? _dragStart;
-  Offset? _dragEnd;
-
-  // Inline edit state
+  // Interaction state
+  Offset? _dragStart, _dragEnd;
   TextBlock? _editingBlock;
 
   @override
-  void initState() {
-    super.initState();
-    _loadPage();
-  }
+  void initState() { super.initState(); _loadPage(); }
 
   @override
-  void didUpdateWidget(_PageWithTextOverlay old) {
+  void didUpdateWidget(_PageCanvas old) {
     super.didUpdateWidget(old);
     if (old.page != widget.page || old.document.fileId != widget.document.fileId) {
-      _textBlocks = [];
-      _textBlocksLoaded = false;
+      _words = []; _ocrDone = false;
       _loadPage();
     }
   }
@@ -90,582 +73,414 @@ class _PageWithTextOverlayState extends ConsumerState<_PageWithTextOverlay> {
     setState(() { _loading = true; _error = null; });
     try {
       final api = ref.read(apiServiceProvider);
-      final data = await api.getPageImageFull(widget.document.fileId, widget.page, dpi: 150);
+      final data = await api.getPageImageFull(widget.document.fileId, widget.page);
       setState(() {
-        _imageB64 = data['image_base64'] as String;
-        _pdfWidth = (data['pdf_width'] ?? 595).toDouble();
-        _pdfHeight = (data['pdf_height'] ?? 842).toDouble();
-        _renderWidth = (data['render_width'] ?? 892).toDouble();
-        _renderHeight = (data['render_height'] ?? 1263).toDouble();
-        _loading = false;
+        _imageB64  = data['image_base64'] as String;
+        _pdfW      = (data['pdf_width']    ?? 595).toDouble();
+        _pdfH      = (data['pdf_height']   ?? 842).toDouble();
+        _renderW   = (data['render_width'] ?? 892).toDouble();
+        _renderH   = (data['render_height']?? 1263).toDouble();
+        _loading   = false;
       });
+      // Load existing text blocks (works if PDF already has text layer)
+      await _tryLoadTextBlocks();
     } catch (e) {
       setState(() { _error = e.toString(); _loading = false; });
     }
   }
 
-  Future<void> _loadTextBlocks() async {
-    if (_textBlocksLoaded) return;
+  Future<void> _tryLoadTextBlocks() async {
     try {
       final api = ref.read(apiServiceProvider);
       final blocks = await api.getPageTextBlocks(widget.document.fileId, widget.page);
-      setState(() { _textBlocks = blocks; _textBlocksLoaded = true; });
+      if (blocks.isNotEmpty) {
+        setState(() { _words = blocks; _ocrDone = true; });
+      }
     } catch (_) {}
   }
 
-  // Scale factor: PDF coords → rendered pixel coords
-  double get _scaleX => _renderWidth / _pdfWidth;
-  double get _scaleY => _renderHeight / _pdfHeight;
-
-  // Convert rendered pixel position → PDF coordinate
-  Offset _toPdfCoords(Offset pixelPos) =>
-      Offset(pixelPos.dx / _scaleX, pixelPos.dy / _scaleY);
-
-  @override
-  Widget build(BuildContext context) {
-    if (_loading) return _loadingWidget();
-    if (_error != null) return _errorWidget(_error!);
-    return _buildPage();
-  }
-
-  Widget _buildPage() {
-    final activeTool = ref.watch(activeToolProvider);
-
-    return Container(
-      margin: const EdgeInsets.all(20),
-      decoration: BoxDecoration(
-        color: Colors.white,
-        boxShadow: [
-          BoxShadow(color: Colors.black.withOpacity(0.35), blurRadius: 20, offset: const Offset(0, 4))
-        ],
-      ),
-      child: GestureDetector(
-        onTapDown: (d) => _onTap(d.localPosition, activeTool),
-        onPanStart: (d) {
-          if (activeTool != EditorTool.select && activeTool != EditorTool.editText) {
-            setState(() { _dragStart = d.localPosition; _dragEnd = d.localPosition; });
-          }
-        },
-        onPanUpdate: (d) {
-          if (_dragStart != null) setState(() => _dragEnd = d.localPosition);
-        },
-        onPanEnd: (_) => _onDragEnd(activeTool),
-        child: Stack(
-          children: [
-            // ── PDF page image ──
-            Image.memory(
-              base64Decode(_imageB64!),
-              fit: BoxFit.contain,
-              width: _renderWidth,
-              height: _renderHeight,
-            ),
-
-            // ── Text block overlays (edit mode) ──
-            if (activeTool == EditorTool.editText)
-              ..._textBlocks.map((block) => _buildTextBlockOverlay(block)),
-
-            // ── Selection rectangle for annotations ──
-            if (_dragStart != null && _dragEnd != null)
-              Positioned.fill(
-                child: CustomPaint(
-                  painter: _SelectionPainter(
-                    start: _dragStart!, end: _dragEnd!, tool: activeTool,
-                  ),
-                ),
-              ),
-
-            // ── Cursor hint for insert text ──
-            if (activeTool == EditorTool.insertText)
-              Positioned.fill(
-                child: Container(
-                  color: Colors.blue.withOpacity(0.04),
-                  child: const Center(
-                    child: Text(
-                      'Tap anywhere to insert text',
-                      style: TextStyle(color: Colors.blue, fontSize: 13),
-                    ),
-                  ),
-                ),
-              ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  // ── Text block overlay: shows a transparent hover box over each text span ──
-  Widget _buildTextBlockOverlay(TextBlock block) {
-    final left = block.x0 * _scaleX;
-    final top = block.y0 * _scaleY;
-    final w = block.width * _scaleX;
-    final h = (block.height * _scaleY).clamp(14.0, 200.0);
-    final isEditing = _editingBlock?.text == block.text &&
-        _editingBlock?.x0 == block.x0 && _editingBlock?.y0 == block.y0;
-
-    return Positioned(
-      left: left, top: top, width: w.clamp(20.0, 600.0), height: h,
-      child: GestureDetector(
-        onTap: () => _startInlineEdit(block),
-        child: Container(
-          decoration: BoxDecoration(
-            color: isEditing ? Colors.blue.withOpacity(0.15) : Colors.transparent,
-            border: Border.all(
-              color: isEditing ? Colors.blue : Colors.transparent,
-              width: isEditing ? 1.5 : 0,
-            ),
-          ),
-          child: isEditing
-              ? null
-              : Tooltip(
-                  message: 'Click to edit: "${block.text}"',
-                  child: Container(color: Colors.transparent),
-                ),
-        ),
-      ),
-    );
-  }
-
-  void _onTap(Offset pixelPos, EditorTool tool) {
-    if (tool == EditorTool.editText) {
-      // Check if tapped on a text block
-      _loadTextBlocks();
-      final pdfPos = _toPdfCoords(pixelPos);
-      TextBlock? hit;
-      for (final b in _textBlocks) {
-        if (pdfPos.dx >= b.x0 && pdfPos.dx <= b.x1 &&
-            pdfPos.dy >= b.y0 && pdfPos.dy <= b.y1) {
-          hit = b;
-          break;
-        }
+  Future<void> _runOCR() async {
+    setState(() { _ocrRunning = true; });
+    try {
+      final api = ref.read(apiServiceProvider);
+      final result = await api.runOcr(widget.document.fileId);
+      final pageData = result['pages'] as Map<String, dynamic>? ?? {};
+      final rawWords = pageData[widget.page.toString()] as List? ??
+                       pageData[widget.page] as List? ?? [];
+      setState(() {
+        _words = rawWords
+            .map((w) => TextBlock.fromJson(Map<String, dynamic>.from(w)))
+            .toList();
+        _ocrDone    = true;
+        _ocrRunning = false;
+      });
+    } catch (e) {
+      setState(() { _ocrRunning = false; });
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('OCR failed: $e'), backgroundColor: Colors.red));
       }
-      if (hit != null) {
-        _startInlineEdit(hit);
-      } else {
-        // Tapped on empty space — show insert dialog
-        _showInsertTextDialog(pdfPos);
-      }
-    } else if (tool == EditorTool.insertText) {
-      _showInsertTextDialog(_toPdfCoords(pixelPos));
-    } else if (tool == EditorTool.text) {
-      _showAnnotationTextDialog(_toPdfCoords(pixelPos));
     }
   }
 
-  // ── Word-like inline edit dialog ──────────────────────────────────────────
+  // ── Scale helpers ──
+  double get _sx => _renderW / _pdfW;
+  double get _sy => _renderH / _pdfH;
+  Offset _toPdf(Offset px) => Offset(px.dx / _sx, px.dy / _sy);
+
+  @override
+  Widget build(BuildContext context) {
+    if (_loading) return _shimmer();
+    if (_error != null) return _errorView();
+    return _buildCanvas();
+  }
+
+  Widget _buildCanvas() {
+    final tool = ref.watch(activeToolProvider);
+
+    return Stack(
+      children: [
+        // ── Page card ──
+        Container(
+          margin: const EdgeInsets.all(20),
+          decoration: BoxDecoration(
+            color: Colors.white,
+            boxShadow: [BoxShadow(
+              color: Colors.black.withOpacity(0.35),
+              blurRadius: 20, offset: const Offset(0, 4))],
+          ),
+          child: GestureDetector(
+            onTapDown: (d) => _onTap(d.localPosition, tool),
+            onPanStart: (d) {
+              if (_isDragTool(tool)) setState(() { _dragStart = d.localPosition; _dragEnd = d.localPosition; });
+            },
+            onPanUpdate: (d) { if (_dragStart != null) setState(() => _dragEnd = d.localPosition); },
+            onPanEnd: (_) => _onDragEnd(tool),
+            child: Stack(children: [
+              // PDF image
+              Image.memory(base64Decode(_imageB64!), fit: BoxFit.contain, width: _renderW, height: _renderH),
+
+              // Edit-text overlays
+              if (tool == EditorTool.editText && _ocrDone)
+                ..._words.map(_wordOverlay),
+
+              // Insert-text hint
+              if (tool == EditorTool.insertText)
+                Positioned.fill(child: Container(
+                  color: Colors.blue.withOpacity(0.03),
+                  child: const Align(alignment: Alignment.topCenter,
+                    child: Padding(padding: EdgeInsets.only(top: 8),
+                      child: Text('Tap anywhere to insert text',
+                        style: TextStyle(color: Colors.blue, fontSize: 12, fontWeight: FontWeight.w500)))),
+                )),
+
+              // Drag selection rect
+              if (_dragStart != null && _dragEnd != null)
+                Positioned.fill(child: CustomPaint(
+                  painter: _SelPainter(start: _dragStart!, end: _dragEnd!, tool: tool))),
+            ]),
+          ),
+        ),
+
+        // ── OCR banner (shown when Edit Text is active but OCR not done) ──
+        if (tool == EditorTool.editText && !_ocrDone)
+          Positioned(
+            left: 24, right: 24, top: 24,
+            child: _OcrBanner(running: _ocrRunning, onRun: _runOCR),
+          ),
+      ],
+    );
+  }
+
+  Widget _wordOverlay(TextBlock block) {
+    final left = block.x0 * _sx;
+    final top  = block.y0 * _sy;
+    final w    = (block.width  * _sx).clamp(10.0, 800.0);
+    final h    = (block.height * _sy).clamp(8.0,  120.0);
+    final isEditing = identical(_editingBlock, block);
+
+    return Positioned(
+      left: left, top: top, width: w, height: h,
+      child: GestureDetector(
+        onTap: () => _startInlineEdit(block),
+        child: Tooltip(
+          message: '"${block.text}"  — tap to edit',
+          child: Container(
+            decoration: BoxDecoration(
+              color: isEditing ? Colors.blue.withOpacity(0.18) : Colors.yellow.withOpacity(0.01),
+              border: Border.all(
+                color: isEditing ? Colors.blue : Colors.blue.withOpacity(0.25),
+                width: isEditing ? 1.5 : 0.8,
+              ),
+              borderRadius: BorderRadius.circular(2),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  // ── Edit dialog ──────────────────────────────────────────────────────────
   void _startInlineEdit(TextBlock block) async {
     setState(() => _editingBlock = block);
-
-    final controller = TextEditingController(text: block.text);
-    double fontSize = block.size;
-    bool bold = block.isBold;
-    bool italic = block.isItalic;
-    String fontColor = '#000000';
-    String selectedFont = 'helv';
+    final ctrl   = TextEditingController(text: block.text);
+    double fSize = block.size.clamp(6.0, 48.0);
+    bool bold = false, italic = false;
+    String color = '#000000', fontName = 'helv';
 
     final result = await showDialog<Map<String, dynamic>>(
       context: context,
       barrierDismissible: false,
-      builder: (ctx) => StatefulBuilder(
-        builder: (ctx, setDlg) => AlertDialog(
-          title: Row(
-            children: [
-              const Icon(Icons.edit_document, color: AppColors.accent, size: 20),
-              const SizedBox(width: 8),
-              const Text('Edit Text', style: TextStyle(fontSize: 16)),
-              const Spacer(),
-              // Font family selector
-              DropdownButton<String>(
-                value: selectedFont,
-                isDense: true,
-                items: const [
-                  DropdownMenuItem(value: 'helv', child: Text('Helvetica')),
-                  DropdownMenuItem(value: 'timr', child: Text('Times')),
-                  DropdownMenuItem(value: 'cour', child: Text('Courier')),
-                ],
-                onChanged: (v) => setDlg(() => selectedFont = v!),
-              ),
+      builder: (ctx) => StatefulBuilder(builder: (ctx, setD) => AlertDialog(
+        backgroundColor: Colors.white,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+        title: Row(children: [
+          const Icon(Icons.edit_document, color: AppColors.accent, size: 20),
+          const SizedBox(width: 8),
+          const Expanded(child: Text('Edit Text', style: TextStyle(fontSize: 16))),
+          // Font dropdown
+          DropdownButton<String>(
+            value: fontName, isDense: true,
+            items: const [
+              DropdownMenuItem(value: 'helv',  child: Text('Helvetica', style: TextStyle(fontSize: 12))),
+              DropdownMenuItem(value: 'timr',  child: Text('Times',     style: TextStyle(fontSize: 12))),
+              DropdownMenuItem(value: 'cour',  child: Text('Courier',   style: TextStyle(fontSize: 12))),
             ],
+            onChanged: (v) => setD(() => fontName = v!),
           ),
-          content: SizedBox(
-            width: 480,
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                // ── Formatting toolbar ──
-                Container(
-                  padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 4),
-                  decoration: BoxDecoration(
-                    color: Colors.grey.shade100,
-                    borderRadius: BorderRadius.circular(8),
-                  ),
-                  child: Row(
-                    children: [
-                      // Font size
-                      const Text('Size:', style: TextStyle(fontSize: 12)),
-                      const SizedBox(width: 4),
-                      SizedBox(
-                        width: 50,
-                        child: TextFormField(
-                          initialValue: fontSize.toStringAsFixed(0),
-                          keyboardType: TextInputType.number,
-                          decoration: const InputDecoration(
-                            isDense: true,
-                            contentPadding: EdgeInsets.symmetric(horizontal: 6, vertical: 4),
-                            border: OutlineInputBorder(),
-                          ),
-                          onChanged: (v) => fontSize = double.tryParse(v) ?? fontSize,
-                        ),
-                      ),
-                      const SizedBox(width: 8),
-                      // Bold
-                      _fmtBtn('B', bold, () => setDlg(() => bold = !bold),
-                          const TextStyle(fontWeight: FontWeight.bold, fontSize: 14)),
-                      const SizedBox(width: 4),
-                      // Italic
-                      _fmtBtn('I', italic, () => setDlg(() => italic = !italic),
-                          const TextStyle(fontStyle: FontStyle.italic, fontSize: 14)),
-                      const SizedBox(width: 8),
-                      // Color picker (simple presets)
-                      const Text('Color:', style: TextStyle(fontSize: 12)),
-                      const SizedBox(width: 4),
-                      ...[
-                        ('#000000', Colors.black), ('#CC0000', Colors.red),
-                        ('#0000CC', Colors.blue), ('#006600', Colors.green),
-                      ].map((pair) => GestureDetector(
-                        onTap: () => setDlg(() => fontColor = pair.$1),
-                        child: Container(
-                          margin: const EdgeInsets.only(right: 4),
-                          width: 20, height: 20,
-                          decoration: BoxDecoration(
-                            color: pair.$2,
-                            shape: BoxShape.circle,
-                            border: Border.all(
-                              color: fontColor == pair.$1 ? Colors.orange : Colors.transparent,
-                              width: 2,
-                            ),
-                          ),
-                        ),
-                      )),
-                    ],
-                  ),
-                ),
-                const SizedBox(height: 12),
-                // ── Text editor ──
-                TextField(
-                  controller: controller,
-                  autofocus: true,
-                  maxLines: 6,
-                  style: TextStyle(
-                    fontSize: (fontSize * 0.9).clamp(8, 24),
-                    fontWeight: bold ? FontWeight.bold : FontWeight.normal,
-                    fontStyle: italic ? FontStyle.italic : FontStyle.normal,
-                  ),
-                  decoration: InputDecoration(
-                    hintText: 'Edit text...',
-                    border: const OutlineInputBorder(),
-                    filled: true,
-                    fillColor: Colors.yellow.shade50,
-                    helperText: 'Original: "${block.text}"',
-                    helperStyle: const TextStyle(fontSize: 11, color: Colors.grey),
-                  ),
-                ),
-              ],
+        ]),
+        content: SizedBox(width: 480, child: Column(mainAxisSize: MainAxisSize.min, children: [
+          // Formatting bar
+          _FormatBar(
+            fontSize: fSize, bold: bold, italic: italic, color: color,
+            onSizeChange: (v) => setD(() => fSize = v),
+            onBold:  () => setD(() => bold  = !bold),
+            onItalic:() => setD(() => italic= !italic),
+            onColor: (v) => setD(() => color= v),
+          ),
+          const SizedBox(height: 12),
+          // Text field
+          TextField(
+            controller: ctrl,
+            autofocus: true,
+            maxLines: 6,
+            style: TextStyle(
+              fontSize: (fSize * 0.85).clamp(8, 22).toDouble(),
+              fontWeight: bold   ? FontWeight.bold : FontWeight.normal,
+              fontStyle:  italic ? FontStyle.italic : FontStyle.normal,
+            ),
+            decoration: InputDecoration(
+              border: const OutlineInputBorder(),
+              filled: true, fillColor: Colors.yellow.shade50,
+              helperText: 'Original: "${block.text}"',
+              helperStyle: const TextStyle(fontSize: 10, color: Colors.grey),
             ),
           ),
-          actions: [
-            TextButton(
-              onPressed: () { Navigator.pop(ctx); setState(() => _editingBlock = null); },
-              child: const Text('Cancel'),
-            ),
-            OutlinedButton.icon(
-              onPressed: () => Navigator.pop(ctx, {'delete': true}),
-              icon: const Icon(Icons.delete_outline, size: 16, color: Colors.red),
-              label: const Text('Delete Text', style: TextStyle(color: Colors.red)),
-            ),
-            ElevatedButton.icon(
-              onPressed: () => Navigator.pop(ctx, {
-                'text': controller.text,
-                'font_name': selectedFont,
-                'font_size': fontSize,
-                'font_color': fontColor,
-                'bold': bold,
-                'italic': italic,
-              }),
-              icon: const Icon(Icons.check, size: 16),
-              label: const Text('Apply'),
-              style: ElevatedButton.styleFrom(backgroundColor: AppColors.accent),
-            ),
-          ],
-        ),
-      ),
+        ])),
+        actions: [
+          TextButton(onPressed: () { Navigator.pop(ctx); setState(() => _editingBlock = null); },
+            child: const Text('Cancel')),
+          OutlinedButton.icon(
+            onPressed: () => Navigator.pop(ctx, {'delete': true}),
+            icon: const Icon(Icons.delete_outline, size: 16, color: Colors.red),
+            label: const Text('Delete', style: TextStyle(color: Colors.red)),
+          ),
+          ElevatedButton.icon(
+            onPressed: () => Navigator.pop(ctx, {
+              'text': ctrl.text, 'font_name': fontName, 'font_size': fSize,
+              'font_color': color, 'bold': bold, 'italic': italic,
+            }),
+            icon: const Icon(Icons.check, size: 16),
+            label: const Text('Apply'),
+            style: ElevatedButton.styleFrom(backgroundColor: AppColors.accent),
+          ),
+        ],
+      )),
     );
 
     setState(() => _editingBlock = null);
-
     if (result == null) return;
-
     final api = ref.read(apiServiceProvider);
 
     if (result['delete'] == true) {
-      // Redact the region
       await api.deleteRegion(
-        fileId: widget.document.fileId,
-        pageNumber: widget.page,
-        x0: block.x0, y0: block.y0, x1: block.x1, y1: block.y1,
+        fileId: widget.document.fileId, pageNumber: widget.page,
+        x0: block.x0 - 1, y0: block.y0 - 1,
+        x1: block.x1 + 1, y1: block.y1 + 1,
       );
     } else {
       final newText = result['text'] as String;
-      if (newText == block.text) return; // no change
-
+      if (newText == block.text) return;
       await api.editTextInline(
-        fileId: widget.document.fileId,
-        pageNumber: widget.page,
-        searchText: block.text,
-        replacementText: newText,
+        fileId: widget.document.fileId, pageNumber: widget.page,
+        searchText: block.text, replacementText: newText,
         regionX0: block.x0 - 2, regionY0: block.y0 - 2,
         regionX1: block.x1 + 2, regionY1: block.y1 + 2,
-        fontName: result['font_name'] as String?,
-        fontSize: result['font_size'] as double?,
+        fontName:  result['font_name']  as String?,
+        fontSize:  result['font_size']  as double?,
         fontColor: result['font_color'] as String?,
-        bold: result['bold'] as bool?,
-        italic: result['italic'] as bool?,
+        bold:      result['bold']       as bool?,
+        italic:    result['italic']     as bool?,
       );
     }
-
-    // Reload page image to show changes
-    setState(() {
-      _textBlocksLoaded = false;
-      _textBlocks = [];
-    });
+    // Reload
+    setState(() { _words = []; _ocrDone = false; });
     await _loadPage();
-    await _loadTextBlocks();
   }
 
-  // ── Insert new text dialog ──────────────────────────────────────────────
-  Future<void> _showInsertTextDialog(Offset pdfPos) async {
-    final controller = TextEditingController();
-    double fontSize = 12;
-    bool bold = false;
-    bool italic = false;
-    String fontColor = '#000000';
-    String fontName = 'helv';
-    String align = 'left';
+  // ── Insert text dialog ──────────────────────────────────────────────────
+  void _onTap(Offset px, EditorTool tool) {
+    if (tool == EditorTool.editText) {
+      final pdf = _toPdf(px);
+      // Find closest word
+      TextBlock? hit;
+      double best = double.infinity;
+      for (final b in _words) {
+        if (pdf.dx >= b.x0 - 2 && pdf.dx <= b.x1 + 2 &&
+            pdf.dy >= b.y0 - 2 && pdf.dy <= b.y1 + 2) {
+          final d = (Offset((b.x0+b.x1)/2,(b.y0+b.y1)/2) - pdf).distance;
+          if (d < best) { best = d; hit = b; }
+        }
+      }
+      if (hit != null) _startInlineEdit(hit);
+      else             _showInsertDialog(_toPdf(px));
+    } else if (tool == EditorTool.insertText) {
+      _showInsertDialog(_toPdf(px));
+    } else if (tool == EditorTool.text) {
+      _showNoteDialog(_toPdf(px));
+    }
+  }
+
+  Future<void> _showInsertDialog(Offset pdfPos) async {
+    final ctrl = TextEditingController();
+    double fSize = 12; bool bold = false, italic = false;
+    String color = '#000000', fontName = 'helv', align = 'left';
 
     final result = await showDialog<Map<String, dynamic>>(
       context: context,
-      builder: (ctx) => StatefulBuilder(
-        builder: (ctx, setDlg) => AlertDialog(
-          title: Row(
-            children: [
-              const Icon(Icons.text_fields, color: AppColors.accent, size: 20),
-              const SizedBox(width: 8),
-              const Text('Insert Text', style: TextStyle(fontSize: 16)),
-              const Spacer(),
-              DropdownButton<String>(
-                value: fontName,
-                isDense: true,
-                items: const [
-                  DropdownMenuItem(value: 'helv', child: Text('Helvetica')),
-                  DropdownMenuItem(value: 'timr', child: Text('Times')),
-                  DropdownMenuItem(value: 'cour', child: Text('Courier')),
-                ],
-                onChanged: (v) => setDlg(() => fontName = v!),
-              ),
+      builder: (ctx) => StatefulBuilder(builder: (ctx, setD) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+        title: Row(children: [
+          const Icon(Icons.text_fields_rounded, color: AppColors.accent, size: 20),
+          const SizedBox(width: 8),
+          const Expanded(child: Text('Insert Text', style: TextStyle(fontSize: 16))),
+          DropdownButton<String>(
+            value: fontName, isDense: true,
+            items: const [
+              DropdownMenuItem(value: 'helv', child: Text('Helvetica', style: TextStyle(fontSize: 12))),
+              DropdownMenuItem(value: 'timr', child: Text('Times',     style: TextStyle(fontSize: 12))),
+              DropdownMenuItem(value: 'cour', child: Text('Courier',   style: TextStyle(fontSize: 12))),
             ],
+            onChanged: (v) => setD(() => fontName = v!),
           ),
-          content: SizedBox(
-            width: 480,
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                // Formatting bar
-                Container(
-                  padding: const EdgeInsets.all(6),
-                  decoration: BoxDecoration(color: Colors.grey.shade100, borderRadius: BorderRadius.circular(8)),
-                  child: Row(
-                    children: [
-                      const Text('Size:', style: TextStyle(fontSize: 12)),
-                      const SizedBox(width: 4),
-                      SizedBox(
-                        width: 50,
-                        child: TextFormField(
-                          initialValue: '12',
-                          keyboardType: TextInputType.number,
-                          decoration: const InputDecoration(isDense: true, contentPadding: EdgeInsets.symmetric(horizontal: 6, vertical: 4), border: OutlineInputBorder()),
-                          onChanged: (v) => fontSize = double.tryParse(v) ?? fontSize,
-                        ),
-                      ),
-                      const SizedBox(width: 8),
-                      _fmtBtn('B', bold, () => setDlg(() => bold = !bold), const TextStyle(fontWeight: FontWeight.bold, fontSize: 14)),
-                      const SizedBox(width: 4),
-                      _fmtBtn('I', italic, () => setDlg(() => italic = !italic), const TextStyle(fontStyle: FontStyle.italic, fontSize: 14)),
-                      const SizedBox(width: 8),
-                      // Align
-                      ...[('L', 'left'), ('C', 'center'), ('R', 'right')].map((a) =>
-                        GestureDetector(
-                          onTap: () => setDlg(() => align = a.$2),
-                          child: Container(
-                            margin: const EdgeInsets.only(right: 4),
-                            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                            decoration: BoxDecoration(
-                              color: align == a.$2 ? AppColors.accent.withOpacity(0.2) : Colors.transparent,
-                              borderRadius: BorderRadius.circular(4),
-                              border: Border.all(color: align == a.$2 ? AppColors.accent : Colors.grey.shade300),
-                            ),
-                            child: Text(a.$1, style: const TextStyle(fontSize: 12)),
-                          ),
-                        )),
-                      const SizedBox(width: 4),
-                      ...[('#000000', Colors.black), ('#CC0000', Colors.red), ('#0000CC', Colors.blue), ('#006600', Colors.green)].map((pair) =>
-                        GestureDetector(
-                          onTap: () => setDlg(() => fontColor = pair.$1),
-                          child: Container(
-                            margin: const EdgeInsets.only(right: 4),
-                            width: 20, height: 20,
-                            decoration: BoxDecoration(
-                              color: pair.$2, shape: BoxShape.circle,
-                              border: Border.all(color: fontColor == pair.$1 ? Colors.orange : Colors.transparent, width: 2),
-                            ),
-                          ),
-                        )),
-                    ],
-                  ),
-                ),
-                const SizedBox(height: 12),
-                TextField(
-                  controller: controller,
-                  autofocus: true,
-                  maxLines: 5,
-                  decoration: const InputDecoration(
-                    hintText: 'Type your text here...',
-                    border: OutlineInputBorder(),
-                    filled: true,
-                  ),
-                ),
-              ],
-            ),
+        ]),
+        content: SizedBox(width: 480, child: Column(mainAxisSize: MainAxisSize.min, children: [
+          _FormatBar(
+            fontSize: fSize, bold: bold, italic: italic, color: color,
+            onSizeChange: (v) => setD(() => fSize = v),
+            onBold:  () => setD(() => bold  = !bold),
+            onItalic:() => setD(() => italic= !italic),
+            onColor: (v) => setD(() => color= v),
+            showAlign: true, align: align,
+            onAlign: (v) => setD(() => align = v),
           ),
-          actions: [
-            TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
-            ElevatedButton.icon(
-              onPressed: () => Navigator.pop(ctx, {
-                'text': controller.text,
-                'font_name': fontName, 'font_size': fontSize,
-                'font_color': fontColor, 'bold': bold, 'italic': italic, 'align': align,
-              }),
-              icon: const Icon(Icons.add, size: 16),
-              label: const Text('Insert'),
-              style: ElevatedButton.styleFrom(backgroundColor: AppColors.accent),
-            ),
-          ],
-        ),
-      ),
+          const SizedBox(height: 12),
+          TextField(
+            controller: ctrl, autofocus: true, maxLines: 5,
+            decoration: const InputDecoration(
+              hintText: 'Type here...', border: OutlineInputBorder(), filled: true),
+          ),
+        ])),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+          ElevatedButton.icon(
+            onPressed: () => Navigator.pop(ctx, {
+              'text': ctrl.text, 'font_name': fontName, 'font_size': fSize,
+              'font_color': color, 'bold': bold, 'italic': italic, 'align': align,
+            }),
+            icon: const Icon(Icons.add, size: 16),
+            label: const Text('Insert'),
+            style: ElevatedButton.styleFrom(backgroundColor: AppColors.accent),
+          ),
+        ],
+      )),
     );
 
     if (result == null || (result['text'] as String).isEmpty) return;
-
     final api = ref.read(apiServiceProvider);
     await api.insertTextBlock(
-      fileId: widget.document.fileId,
-      pageNumber: widget.page,
+      fileId: widget.document.fileId, pageNumber: widget.page,
       text: result['text'] as String,
-      x: pdfPos.dx, y: pdfPos.dy,
-      width: 300, height: 200,
-      fontName: result['font_name'] as String,
-      fontSize: result['font_size'] as double,
+      x: pdfPos.dx, y: pdfPos.dy, width: 300, height: 200,
+      fontName:  result['font_name']  as String,
+      fontSize:  result['font_size']  as double,
       fontColor: result['font_color'] as String,
-      bold: result['bold'] as bool,
+      bold:   result['bold']   as bool,
       italic: result['italic'] as bool,
-      align: result['align'] as String,
+      align:  result['align']  as String,
     );
-
-    setState(() { _textBlocksLoaded = false; _textBlocks = []; });
     await _loadPage();
   }
 
-  // ── Old-style annotation text ──────────────────────────────────────────
-  Future<void> _showAnnotationTextDialog(Offset pdfPos) async {
-    final controller = TextEditingController();
-    final result = await showDialog<String>(
+  Future<void> _showNoteDialog(Offset pdfPos) async {
+    final ctrl = TextEditingController();
+    final text = await showDialog<String>(
       context: context,
       builder: (ctx) => AlertDialog(
         title: const Text('Add Note'),
-        content: TextField(controller: controller, maxLines: 3, autofocus: true,
+        content: TextField(controller: ctrl, autofocus: true, maxLines: 3,
           decoration: const InputDecoration(hintText: 'Type note...', border: OutlineInputBorder())),
         actions: [
           TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
-          ElevatedButton(onPressed: () => Navigator.pop(ctx, controller.text), child: const Text('Add')),
+          ElevatedButton(onPressed: () => Navigator.pop(ctx, ctrl.text), child: const Text('Add')),
         ],
       ),
     );
-    if (result == null || result.isEmpty) return;
+    if (text == null || text.isEmpty) return;
     final api = ref.read(apiServiceProvider);
     await api.addAnnotation(
       fileId: widget.document.fileId, page: widget.page,
-      type: 'freetext', content: result,
+      type: 'freetext', content: text,
       x: pdfPos.dx, y: pdfPos.dy, width: 160, height: 40,
     );
     await _loadPage();
   }
 
-  // ── Drag annotation finish ──────────────────────────────────────────────
+  bool _isDragTool(EditorTool t) =>
+      t == EditorTool.highlight || t == EditorTool.underline || t == EditorTool.strikethrough;
+
   Future<void> _onDragEnd(EditorTool tool) async {
     if (_dragStart == null || _dragEnd == null) return;
-    final rect = Rect.fromPoints(_dragStart!, _dragEnd!);
+    final r = Rect.fromPoints(_dragStart!, _dragEnd!);
     setState(() { _dragStart = null; _dragEnd = null; });
-    if (rect.width < 5 || rect.height < 5) return;
-
+    if (r.width < 5 || r.height < 5) return;
     final typeMap = {
       EditorTool.highlight: 'highlight',
       EditorTool.underline: 'underline',
       EditorTool.strikethrough: 'strikethrough',
     };
-    final annType = typeMap[tool];
-    if (annType == null) return;
-
-    final pdfStart = _toPdfCoords(rect.topLeft);
-    final pdfEnd = _toPdfCoords(rect.bottomRight);
+    final type = typeMap[tool]; if (type == null) return;
+    final s = _toPdf(r.topLeft); final e = _toPdf(r.bottomRight);
     final api = ref.read(apiServiceProvider);
     await api.addAnnotation(
       fileId: widget.document.fileId, page: widget.page,
-      type: annType,
-      x: pdfStart.dx, y: pdfStart.dy,
-      width: pdfEnd.dx - pdfStart.dx, height: pdfEnd.dy - pdfStart.dy,
+      type: type, x: s.dx, y: s.dy, width: e.dx - s.dx, height: e.dy - s.dy,
     );
     await _loadPage();
   }
 
-  // ── Helpers ──────────────────────────────────────────────────────────────
+  // ── Loading / error widgets ──────────────────────────────────────────────
 
-  Widget _fmtBtn(String label, bool active, VoidCallback onTap, TextStyle style) {
-    return GestureDetector(
-      onTap: onTap,
-      child: Container(
-        width: 28, height: 28,
-        decoration: BoxDecoration(
-          color: active ? AppColors.accent.withOpacity(0.2) : Colors.transparent,
-          borderRadius: BorderRadius.circular(4),
-          border: Border.all(color: active ? AppColors.accent : Colors.grey.shade300),
-        ),
-        alignment: Alignment.center,
-        child: Text(label, style: style),
-      ),
-    );
-  }
-
-  Widget _loadingWidget() => Container(
+  Widget _shimmer() => Container(
     width: 595, height: 842, color: Colors.white,
-    child: const Center(child: Column(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        CircularProgressIndicator(color: AppColors.accent),
-        SizedBox(height: 12),
-        Text('Loading page...', style: TextStyle(color: AppColors.accent)),
-      ],
-    )),
+    child: const Center(child: Column(mainAxisSize: MainAxisSize.min, children: [
+      CircularProgressIndicator(color: AppColors.accent),
+      SizedBox(height: 12),
+      Text('Loading page...', style: TextStyle(color: AppColors.accent, fontSize: 13)),
+    ])),
   );
 
-  Widget _errorWidget(String err) => Container(
+  Widget _errorView() => Container(
     width: 595, height: 400, color: Colors.white,
     child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
       Icon(Icons.wifi_off_rounded, color: Colors.red.shade400, size: 48),
@@ -673,41 +488,184 @@ class _PageWithTextOverlayState extends ConsumerState<_PageWithTextOverlay> {
       const Text('Could not load page', style: TextStyle(fontWeight: FontWeight.w600)),
       const SizedBox(height: 6),
       const Text('Make sure backend is running on port 8000',
-        style: TextStyle(fontSize: 12, color: Colors.grey), textAlign: TextAlign.center),
+          style: TextStyle(fontSize: 12, color: Colors.grey)),
       const SizedBox(height: 4),
-      Text(err, style: const TextStyle(fontSize: 10, color: Colors.grey), textAlign: TextAlign.center),
+      Text(_error!, style: const TextStyle(fontSize: 10, color: Colors.grey), textAlign: TextAlign.center),
       const SizedBox(height: 16),
-      ElevatedButton.icon(
-        onPressed: _loadPage,
-        icon: const Icon(Icons.refresh, size: 16),
-        label: const Text('Retry'),
-      ),
+      ElevatedButton.icon(onPressed: _loadPage,
+        icon: const Icon(Icons.refresh, size: 16), label: const Text('Retry')),
     ]),
   );
 }
 
-// ─── Selection painter ────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// OCR Banner
+// ─────────────────────────────────────────────────────────────────────────────
 
-class _SelectionPainter extends CustomPainter {
+class _OcrBanner extends StatelessWidget {
+  final bool running;
+  final VoidCallback onRun;
+  const _OcrBanner({required this.running, required this.onRun});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+      decoration: BoxDecoration(
+        color: const Color(0xFF1A1A2E),
+        borderRadius: BorderRadius.circular(10),
+        boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.4), blurRadius: 12)],
+        border: Border.all(color: AppColors.accent.withOpacity(0.5)),
+      ),
+      child: Row(children: [
+        const Icon(Icons.document_scanner_rounded, color: AppColors.accent, size: 22),
+        const SizedBox(width: 12),
+        Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          const Text('OCR Required', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 13)),
+          const SizedBox(height: 2),
+          Text(
+            running ? 'Running Tesseract OCR... this takes 5–20 seconds per page'
+                    : 'This PDF has image-based text. Run OCR to enable click-to-edit.',
+            style: const TextStyle(color: Color(0xFF8888AA), fontSize: 11),
+          ),
+        ])),
+        const SizedBox(width: 12),
+        running
+            ? const SizedBox(width: 24, height: 24, child: CircularProgressIndicator(color: AppColors.accent, strokeWidth: 2))
+            : ElevatedButton.icon(
+                onPressed: onRun,
+                icon: const Icon(Icons.scanner, size: 15),
+                label: const Text('Run OCR', style: TextStyle(fontSize: 12)),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: AppColors.accent,
+                  padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+                  minimumSize: Size.zero,
+                ),
+              ),
+      ]),
+    );
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Formatting bar (shared between edit & insert dialogs)
+// ─────────────────────────────────────────────────────────────────────────────
+
+class _FormatBar extends StatelessWidget {
+  final double fontSize;
+  final bool bold, italic;
+  final String color;
+  final ValueChanged<double> onSizeChange;
+  final VoidCallback onBold, onItalic;
+  final ValueChanged<String> onColor;
+  final bool showAlign;
+  final String? align;
+  final ValueChanged<String>? onAlign;
+
+  const _FormatBar({
+    required this.fontSize, required this.bold, required this.italic, required this.color,
+    required this.onSizeChange, required this.onBold, required this.onItalic, required this.onColor,
+    this.showAlign = false, this.align, this.onAlign,
+  });
+
+  static const _colors = [
+    ('#000000', Color(0xFF000000)),
+    ('#CC0000', Color(0xFFCC0000)),
+    ('#0055CC', Color(0xFF0055CC)),
+    ('#006600', Color(0xFF006600)),
+    ('#7700AA', Color(0xFF7700AA)),
+    ('#CC6600', Color(0xFFCC6600)),
+  ];
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+      decoration: BoxDecoration(
+        color: Colors.grey.shade100,
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: Colors.grey.shade300),
+      ),
+      child: Wrap(spacing: 6, runSpacing: 4, crossAxisAlignment: WrapCrossAlignment.center, children: [
+        // Font size
+        SizedBox(width: 52, child: TextFormField(
+          initialValue: fontSize.toStringAsFixed(0),
+          keyboardType: TextInputType.number,
+          decoration: const InputDecoration(
+            isDense: true, labelText: 'pt',
+            contentPadding: EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+            border: OutlineInputBorder()),
+          onChanged: (v) => onSizeChange(double.tryParse(v) ?? fontSize),
+        )),
+
+        // Bold
+        _fmtBtn('B', bold, onBold, const TextStyle(fontWeight: FontWeight.bold, fontSize: 14)),
+        // Italic
+        _fmtBtn('I', italic, onItalic, const TextStyle(fontStyle: FontStyle.italic, fontSize: 14)),
+
+        if (showAlign && onAlign != null) ...[
+          const SizedBox(width: 4),
+          ...(['L', 'C', 'R'].map((a) {
+            final av = a == 'L' ? 'left' : a == 'C' ? 'center' : 'right';
+            return _fmtBtn(a, align == av, () => onAlign!(av), const TextStyle(fontSize: 12));
+          })),
+        ],
+
+        const SizedBox(width: 4),
+        // Color swatches
+        ..._colors.map((pair) => GestureDetector(
+          onTap: () => onColor(pair.$1),
+          child: Container(
+            width: 20, height: 20,
+            decoration: BoxDecoration(
+              color: pair.$2, shape: BoxShape.circle,
+              border: Border.all(
+                color: color == pair.$1 ? Colors.orange : Colors.transparent, width: 2)),
+          ),
+        )),
+      ]),
+    );
+  }
+
+  Widget _fmtBtn(String lbl, bool active, VoidCallback onTap, TextStyle style) =>
+    GestureDetector(
+      onTap: onTap,
+      child: Container(
+        width: 28, height: 28,
+        decoration: BoxDecoration(
+          color: active ? AppColors.accent.withOpacity(0.2) : Colors.white,
+          borderRadius: BorderRadius.circular(4),
+          border: Border.all(color: active ? AppColors.accent : Colors.grey.shade300),
+        ),
+        alignment: Alignment.center,
+        child: Text(lbl, style: style),
+      ),
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Selection painter
+// ─────────────────────────────────────────────────────────────────────────────
+
+class _SelPainter extends CustomPainter {
   final Offset start, end;
   final EditorTool tool;
-
-  const _SelectionPainter({required this.start, required this.end, required this.tool});
+  const _SelPainter({required this.start, required this.end, required this.tool});
 
   @override
   void paint(Canvas canvas, Size size) {
-    final colorMap = {
-      EditorTool.highlight: Colors.yellow,
-      EditorTool.underline: Colors.green,
+    final colors = {
+      EditorTool.highlight:     Colors.yellow,
+      EditorTool.underline:     Colors.green,
       EditorTool.strikethrough: Colors.red,
-      EditorTool.draw: Colors.blue,
+      EditorTool.draw:          Colors.blue,
     };
-    final color = colorMap[tool] ?? AppColors.accent;
-    final rect = Rect.fromPoints(start, end);
-    canvas.drawRect(rect, Paint()..color = color.withOpacity(0.25)..style = PaintingStyle.fill);
-    canvas.drawRect(rect, Paint()..color = color..style = PaintingStyle.stroke..strokeWidth = 1.5);
+    final c = colors[tool] ?? AppColors.accent;
+    final r = Rect.fromPoints(start, end);
+    canvas.drawRect(r, Paint()..color = c.withOpacity(0.25)..style = PaintingStyle.fill);
+    canvas.drawRect(r, Paint()..color = c..style = PaintingStyle.stroke..strokeWidth = 1.5);
   }
 
   @override
-  bool shouldRepaint(covariant CustomPainter old) => true;
+  bool shouldRepaint(covariant CustomPainter _) => true;
 }
